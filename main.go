@@ -2,31 +2,31 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
+	v1 "k8s.io/api/core/v1"
 	podsv1alpha1 "k8s.io/kubelet/pkg/apis/pods/v1alpha1"
 )
 
 const (
-	socketPath = "/var/lib/kubelet/pods-api/pods-api.sock"
-	// Updated to use the key you have implemented on the server side.
+	socketPath           = "/var/lib/kubelet/pods-api/pods-api.sock"
 	fieldMaskMetadataKey = "x-kubernetes-fieldmask"
 )
 
 // watchResult holds the outcome from a single event from one of the watch streams.
 type watchResult struct {
 	watcherName string
-	event       *podsv1alpha1.WatchPodsEvent
+	eventType   podsv1alpha1.EventType
+	pod         *v1.Pod
 	messageSize int
 }
 
@@ -46,7 +46,6 @@ func watch(
 
 	reqCtx := ctx
 	if len(maskPaths) > 0 {
-		// The value is a comma-separated list of field paths.
 		headerValue := strings.Join(maskPaths, ",")
 		log.Printf("[%s] Attaching metadata: '%s: %s'", watcherName, fieldMaskMetadataKey, headerValue)
 
@@ -84,9 +83,16 @@ func watch(
 			continue
 		}
 		size := proto.Size(event)
+		pod := &v1.Pod{}
+		if err := pod.Unmarshal(event.GetPod()); err != nil {
+			log.Printf("[%s] Failed to decode pod: %v", watcherName, err)
+			continue
+		}
+
 		results <- watchResult{
 			watcherName: watcherName,
-			event:       event,
+			eventType:   event.GetType(),
+			pod:         pod,
 			messageSize: size,
 		}
 	}
@@ -149,12 +155,12 @@ func main() {
 	log.Println("Both watch streams started. Waiting for pod events...")
 
 	for result := range results {
-		prettyEvent := prototext.Format(result.event)
+		prettyPod := fmt.Sprintf("%+v", result.pod)
 		log.Printf("EVENT %s [%s]: Size: %4d bytes\n---\n%s\n---",
-			result.event.GetType(),
+			result.eventType,
 			result.watcherName,
 			result.messageSize,
-			prettyEvent,
+			prettyPod,
 		)
 	}
 
