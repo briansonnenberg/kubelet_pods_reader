@@ -1,26 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	podsv1alpha1 "k8s.io/kubelet/pkg/apis/pods/v1alpha1"
 )
 
 const (
-	socketPath           = "/var/lib/kubelet/pods-api/pods-api.sock"
-	fieldMaskMetadataKey = "x-kubernetes-fieldmask"
+	socketPath = "/var/lib/kubelet/pods-api/pods-api.sock"
+)
+
+var (
+	interval = flag.Duration("interval", 0, "Interval for periodic List and Get checks (e.g. 5s, 1m). 0 means off.")
 )
 
 // watchResult holds the outcome from a single event from one of the watch streams.
@@ -28,7 +34,9 @@ type watchResult struct {
 	watcherName string
 	eventType   podsv1alpha1.EventType
 	pod         *v1.Pod
-	messageSize int
+	podBytes    []byte
+	eventSize   int
+	podSize     int
 }
 
 // watch is a function that runs a gRPC watch stream in a goroutine.
@@ -37,7 +45,6 @@ func watch(
 	wg *sync.WaitGroup,
 	watcherName string,
 	client podsv1alpha1.PodsClient,
-	maskPaths []string,
 	results chan<- watchResult,
 ) {
 	defer func() {
@@ -46,14 +53,6 @@ func watch(
 	log.Printf("[%s] Starting watch stream...", watcherName)
 
 	reqCtx := ctx
-	if len(maskPaths) > 0 {
-		headerValue := strings.Join(maskPaths, ",")
-		log.Printf("[%s] Attaching metadata: '%s: %s'", watcherName, fieldMaskMetadataKey, headerValue)
-
-		md := metadata.New(map[string]string{fieldMaskMetadataKey: headerValue})
-		reqCtx = metadata.NewOutgoingContext(ctx, md)
-	}
-
 	req := &podsv1alpha1.WatchPodsRequest{}
 
 	stream, err := client.WatchPods(reqCtx, req)
@@ -83,23 +82,30 @@ func watch(
 			log.Printf("[%s] Received nil event from stream. Skipping.", watcherName)
 			continue
 		}
-		size := proto.Size(event)
+		eventSize := proto.Size(event)
+		podBytes := event.GetPod()
+		podSize := len(podBytes)
 		pod := &v1.Pod{}
-		if err := pod.Unmarshal(event.GetPod()); err != nil {
-			log.Printf("[%s] Failed to decode pod: %v", watcherName, err)
-			continue
+		if podSize > 0 {
+			if err := pod.Unmarshal(podBytes); err != nil {
+				log.Printf("[%s] Failed to decode pod: %v", watcherName, err)
+				continue
+			}
 		}
 
 		results <- watchResult{
 			watcherName: watcherName,
 			eventType:   event.GetType(),
 			pod:         pod,
-			messageSize: size,
+			podBytes:    podBytes,
+			eventSize:   eventSize,
+			podSize:     podSize,
 		}
 	}
 }
 
 func main() {
+	flag.Parse()
 	log.Println("--- Kubelet Pod Watcher Client ---")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -122,101 +128,113 @@ func main() {
 	log.Printf("Successfully connected to %s", socketPath)
 	client := podsv1alpha1.NewPodsClient(conn)
 
-	fieldMaskPaths := []string{
-		"metadata.name",
-		"metadata.namespace",
-		"spec.containers.name",
-		"spec.initContainers.name",
-		"spec.initContainers.restartPolicy",
-		"spec.ephemeralContainers.name",
-		"status.phase",
-		"status.containerStatuses.name",
-		"status.containerStatuses.ready",
-		"status.initContainerStatuses.name",
-		"status.initContainerStatuses.ready",
-		"status.ephemeralContainerStatuses.name",
-		"status.ephemeralContainerStatuses.ready",
-	}
-
 	var wg sync.WaitGroup
 	results := make(chan watchResult)
 
 	// Periodic List and Get checks
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+	if *interval > 0 {
+		go func() {
+			ticker := time.NewTicker(*interval)
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				log.Println("--- Periodic List Check ---")
-				listResp, err := client.ListPods(ctx, &podsv1alpha1.ListPodsRequest{})
-				if err != nil {
-					log.Printf("ListPods failed: %v", err)
-					continue
-				}
-
-				podsList := listResp.GetPods()
-				log.Printf("ListPods returned %d pods", len(podsList))
-
-				if len(podsList) > 0 {
-					p := &v1.Pod{}
-					// Assuming the list returns items compatible with Unmarshal (likely []byte)
-					if err := p.Unmarshal(podsList[0]); err != nil {
-						log.Printf("Failed to unmarshal first pod from list: %v", err)
-						continue
-					}
-
-					log.Printf("Attempting GetPod for %s/%s (UID: %s)", p.Namespace, p.Name, p.UID)
-					getResp, err := client.GetPod(ctx, &podsv1alpha1.GetPodRequest{
-						PodUID: string(p.UID),
-					})
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					log.Println("--- Periodic List Check ---")
+					listResp, err := client.ListPods(ctx, &podsv1alpha1.ListPodsRequest{})
 					if err != nil {
-						log.Printf("GetPod failed: %v", err)
+						log.Printf("ListPods failed: %v", err)
 						continue
 					}
 
-					p2 := &v1.Pod{}
-					if err := p2.Unmarshal(getResp.GetPod()); err != nil {
-						log.Printf("Failed to unmarshal pod from GetPod: %v", err)
-						continue
+					podsList := listResp.GetPods()
+					log.Printf("ListPods returned %d pods", len(podsList))
+
+					if len(podsList) > 0 {
+						p := &v1.Pod{}
+						// Assuming the list returns items compatible with Unmarshal (likely []byte)
+						if err := p.Unmarshal(podsList[0]); err != nil {
+							log.Printf("Failed to unmarshal first pod from list: %v", err)
+							continue
+						}
+
+						log.Printf("Attempting GetPod for %s/%s (UID: %s)", p.Namespace, p.Name, p.UID)
+						getResp, err := client.GetPod(ctx, &podsv1alpha1.GetPodRequest{
+							PodUID: string(p.UID),
+						})
+						if err != nil {
+							log.Printf("GetPod failed: %v", err)
+							continue
+						}
+
+						p2 := &v1.Pod{}
+						if err := p2.Unmarshal(getResp.GetPod()); err != nil {
+							log.Printf("Failed to unmarshal pod from GetPod: %v", err)
+							continue
+						}
+						b, _ := json.MarshalIndent(p2, "", "  ")
+						log.Printf("Successfully performed GetPod for %s/%s:\n%s", p2.Namespace, p2.Name, string(b))
 					}
-					b, _ := json.MarshalIndent(p2, "", "  ")
-					log.Printf("Successfully performed GetPod for %s/%s:\n%s", p2.Namespace, p2.Name, string(b))
 				}
 			}
-		}
-	}()
+		}()
+	}
 
-	wg.Add(2)
-	// Launch the unmasked watch (sends no metadata)
-	go watch(ctx, &wg, "Unmasked  ", client, nil, results)
-
-	// Launch the masked watch (sends the 'x-kubernetes-fieldmask' metadata)
-	go watch(ctx, &wg, "Masked    ", client, fieldMaskPaths, results)
+	wg.Add(1)
+	// Launch the watch stream
+	go watch(ctx, &wg, "Watcher   ", client, results)
 
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	log.Println("Both watch streams started. Waiting for pod events...")
+	log.Println("Watch stream started. Waiting for pod events...")
 
+	type cachedPod struct {
+		pod   *v1.Pod
+		bytes []byte
+	}
+	podsCache := make(map[string]cachedPod)
 	for result := range results {
-		b, err := json.MarshalIndent(result.pod, "", "  ")
-		if err != nil {
-			log.Printf("Failed to marshal pod: %v", err)
-			continue
+		pod := result.pod
+		uid := string(pod.UID)
+		oldEntry, exists := podsCache[uid]
+		oldPod := oldEntry.pod
+
+		switch result.eventType {
+		case podsv1alpha1.EventType_ADDED:
+			log.Printf("EVENT ADDED    [%s]: %s/%s (EventSize: %d, PodSize: %d)", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+			podsCache[uid] = cachedPod{pod: pod, bytes: result.podBytes}
+		case podsv1alpha1.EventType_DELETED:
+			log.Printf("EVENT DELETED  [%s]: %s/%s (EventSize: %d, PodSize: %d)", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+			delete(podsCache, uid)
+		case podsv1alpha1.EventType_MODIFIED:
+			if exists {
+				diff := cmp.Diff(oldPod, pod, cmpopts.IgnoreUnexported(v1.Pod{}, v1.PodSpec{}, v1.PodStatus{}, metav1.ObjectMeta{}))
+				if diff != "" {
+					log.Printf("EVENT MODIFIED [%s]: %s/%s (EventSize: %d, PodSize: %d)\nDiff:\n%s", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize, diff)
+				} else {
+					if !bytes.Equal(oldEntry.bytes, result.podBytes) {
+						log.Printf("EVENT MODIFIED [%s]: %s/%s (EventSize: %d, PodSize: %d, bytes changed but semantic diff is empty - likely unknown fields or internal metadata)", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+					} else {
+						log.Printf("EVENT MODIFIED [%s]: %s/%s (EventSize: %d, PodSize: %d, no changes in pod bytes)", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+					}
+				}
+			} else {
+				log.Printf("EVENT MODIFIED (new) [%s]: %s/%s (EventSize: %d, PodSize: %d)", result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+			}
+			podsCache[uid] = cachedPod{pod: pod, bytes: result.podBytes}
+		case podsv1alpha1.EventType_INITIAL_SYNC_COMPLETE:
+			log.Printf("EVENT INITIAL_SYNC_COMPLETE [%s]: (EventSize: %d)", result.watcherName, result.eventSize)
+		default:
+			log.Printf("EVENT %-8s [%s]: %s/%s (EventSize: %d, PodSize: %d)", result.eventType, result.watcherName, pod.Namespace, pod.Name, result.eventSize, result.podSize)
+			if uid != "" {
+				podsCache[uid] = cachedPod{pod: pod, bytes: result.podBytes}
+			}
 		}
-		prettyPod := string(b)
-		log.Printf("EVENT %s [%s]: Size: %4d bytes\n---\n%s\n---",
-			result.eventType,
-			result.watcherName,
-			result.messageSize,
-			prettyPod,
-		)
 	}
 
 	log.Println("--- Kubelet Pod Watcher Client Finished ---")
